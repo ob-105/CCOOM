@@ -7,7 +7,12 @@ local Engine = {}
 -- Tunable constants: these are best-guess starting points and will very
 -- likely need adjusting once you actually see this running in-game.
 local FOV = math.rad(66)
-local WALL_SCALE = 1 / 64      -- world-units-to-screen-height scale factor
+-- Pinhole-camera projection scale: a wall of world-height H at perpendicular
+-- distance D projects to screen-height (subH * H * WALL_SCALE / D). Derived
+-- from the FOV rather than guessed -- the previous hardcoded 1/64 was ~64x
+-- too small, so every wall rendered at a sub-pixel sliver (invisible against
+-- the ceiling/floor placeholder, not actually "missing").
+local WALL_SCALE = 1 / (2 * math.tan(FOV / 2))
 local MOVE_SPEED = 180         -- map units/second
 local TURN_SPEED = 2.2         -- radians/second
 local CEILING_IDX = 0          -- palette index, placeholder flat shade
