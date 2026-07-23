@@ -1,0 +1,5 @@
+freedoom/*.wad
+freedoom/*.zip
+freedoom/*-CHECKSUM
+__pycache__/
+*.pyc
