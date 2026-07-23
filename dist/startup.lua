@@ -4,6 +4,17 @@
 
 local root = fs.getDir(shell.getRunningProgram())
 
+-- Auto-update from GitHub before launching (see update.lua). Failures here
+-- (offline, HTTP API disabled, etc.) are non-fatal -- we just fall back to
+-- whatever's already on disk.
+local updaterPath = fs.combine(root, "update.lua")
+if fs.exists(updaterPath) then
+  local ok, err = pcall(dofile, updaterPath)
+  if not ok then
+    print("Auto-update skipped: " .. tostring(err))
+  end
+end
+
 local function loadLua(relPath)
   return dofile(fs.combine(root, relPath))
 end
