@@ -3,3 +3,4 @@ freedoom/*.zip
 freedoom/*-CHECKSUM
 __pycache__/
 *.pyc
+.claude/
