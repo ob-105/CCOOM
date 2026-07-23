@@ -1,13 +1,11 @@
 """Bakes a Doom map (vertexes/linedefs/sidedefs/sectors/things) into the
 engine-friendly format CCOOM's Lua renderer consumes.
 
-Stage 1 scope: only one-sided linedefs (solid walls) become renderable wall
-segments, since the stage-1 engine renders a single flat wall height with no
-sector floor/ceiling variation yet. Two-sided linedefs ("portals") and flat
-(floor/ceiling) names are intentionally NOT carried into the stage-1 output
--- the 1MB CC computer storage budget doesn't leave room for data the
-engine doesn't use yet. Re-run this converter against the WAD when stage 2
-needs them; nothing here is lost, just not baked yet.
+Stage 2 scope: solid walls (one-sided linedefs) plus per-sector floor/
+ceiling flats and heights. Two-sided linedefs ("portals") are still not
+carried into the output -- the engine doesn't do room-over-room rendering
+yet -- but sector flats/heights now are, since floor/ceiling casting needs
+them.
 """
 from __future__ import annotations
 
@@ -39,6 +37,8 @@ class SectorOut:
     floor: int
     ceiling: int
     light: int
+    floor_flat: str
+    ceiling_flat: str
 
 
 @dataclass
@@ -57,7 +57,8 @@ def convert_level(wad: Wad, map_name: str) -> LevelData:
     things = read_things(wad.read(ml["THINGS"]))
 
     sectors_out = [
-        SectorOut(s.floor_height, s.ceiling_height, max(0, min(255, s.light_level)))
+        SectorOut(s.floor_height, s.ceiling_height, max(0, min(255, s.light_level)),
+                  s.floor_flat, s.ceiling_flat)
         for s in sectors
     ]
 
@@ -85,20 +86,23 @@ def _i16(v: int) -> int:
     return max(-32768, min(32767, v))
 
 
-def level_to_binary(level: LevelData, tex_name_to_id: dict[str, int]) -> bytes:
+def level_to_binary(level: LevelData, tex_id: dict[tuple[str, str], int]) -> bytes:
     out = bytearray()
     out += struct.pack("<hhh", _i16(level.player_start["x"]), _i16(level.player_start["y"]), _i16(level.player_start["angle"]))
 
     out += struct.pack("<H", len(level.sectors))
     for s in level.sectors:
-        out += struct.pack("<hhB", _i16(s.floor), _i16(s.ceiling), s.light)
+        out += struct.pack(
+            "<hhBBB",
+            _i16(s.floor), _i16(s.ceiling), s.light,
+            tex_id[("flat", s.floor_flat)], tex_id[("flat", s.ceiling_flat)],
+        )
 
     out += struct.pack("<H", len(level.walls))
     for w in level.walls:
-        tex_id = tex_name_to_id[w.tex]
         out += struct.pack(
             "<hhhhHBhh",
             _i16(w.x1), _i16(w.y1), _i16(w.x2), _i16(w.y2),
-            w.sector, tex_id, _i16(w.x_offset), _i16(w.y_offset),
+            w.sector, tex_id[("wall", w.tex)], _i16(w.x_offset), _i16(w.y_offset),
         )
     return bytes(out)

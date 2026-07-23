@@ -1,6 +1,6 @@
--- CCOOM stage-1 engine: textured raycasting walls only (no floor/ceiling
--- textures, no sprites, no sound, no collision yet -- those are later
--- build-order stages).
+-- CCOOM stage-2 engine: textured raycasting walls, floor/ceiling flat
+-- casting, and wall collision. No sprites/enemies/sound yet -- those are
+-- later build-order stages.
 
 local Engine = {}
 
@@ -15,9 +15,12 @@ local FOV = math.rad(66)
 local WALL_SCALE = 1 / (2 * math.tan(FOV / 2))
 local MOVE_SPEED = 180         -- map units/second
 local TURN_SPEED = 2.2         -- radians/second
-local CEILING_IDX = 0          -- palette index, placeholder flat shade
-local FLOOR_IDX = 7            -- palette index, placeholder flat shade
-local FALLBACK_IDX = 8         -- palette index shown if a texture failed to load
+local PLAYER_RADIUS = 16       -- map units; matches Doom's own player radius
+local EYE_HEIGHT = 41          -- map units above/below center; matches Doom's default view height
+local FLAT_TILE = 64           -- Doom flats are always 64x64 world units
+local CEILING_IDX = 0          -- palette index, fallback if a ceiling flat fails to load
+local FLOOR_IDX = 7            -- palette index, fallback if a floor flat fails to load
+local FALLBACK_IDX = 8         -- palette index shown if a wall texture failed to load
 
 -- CC:Tweaked's font has "teletext" mosaic characters at byte codes 128-159:
 -- each splits a cell into a 2-wide x 3-tall grid of sub-pixels, encoded as
@@ -52,6 +55,20 @@ local function texturePixel(tex, row, col)
   else
     return math.floor(byteVal / 16)
   end
+end
+
+-- Flats tile every FLAT_TILE world units; Lua's % already follows the
+-- floor-division convention (result has the same sign as the divisor), so
+-- negative world coordinates wrap correctly with no extra correction.
+local function sampleFlat(tex, wx, wy)
+  if not tex then
+    return nil
+  end
+  local texX = math.floor((wx % FLAT_TILE) * tex.w / FLAT_TILE)
+  local texY = math.floor((wy % FLAT_TILE) * tex.h / FLAT_TILE)
+  if texX >= tex.w then texX = tex.w - 1 end
+  if texY >= tex.h then texY = tex.h - 1 end
+  return texturePixel(tex, texY, texX)
 end
 
 local BLIT_HEX = "0123456789abcdef"
@@ -93,18 +110,60 @@ function Engine.run(paletteTbl, level, root)
 
   local halfTanFov = math.tan(FOV / 2)
 
+  local subH = h * SUB_ROWS
+  local horizonRow = subH / 2
+
+  -- Perpendicular distance to the floor/ceiling plane at each sub-row,
+  -- precomputed once since it only depends on screen geometry (not the
+  -- player's position/angle, which change every frame). Same derivation as
+  -- WALL_SCALE, solved for distance given a fixed EYE_HEIGHT offset from
+  -- center instead of a fixed wall height.
+  local subRowDist = {}
+  for sr = 1, subH do
+    local p
+    if sr > horizonRow then
+      p = sr - horizonRow
+    elseif sr < horizonRow then
+      p = horizonRow - sr
+    end
+    if p and p > 0 then
+      subRowDist[sr] = EYE_HEIGHT * subH * WALL_SCALE / p
+    end
+  end
+
+  local function collides(x, y)
+    for i = 1, numWalls do
+      local wall = walls[i]
+      local abx, aby = wall.x2 - wall.x1, wall.y2 - wall.y1
+      local apx, apy = x - wall.x1, y - wall.y1
+      local abLenSq = abx * abx + aby * aby
+      local t = 0
+      if abLenSq > 0 then
+        t = (apx * abx + apy * aby) / abLenSq
+        if t < 0 then
+          t = 0
+        elseif t > 1 then
+          t = 1
+        end
+      end
+      local cx, cy = wall.x1 + t * abx, wall.y1 + t * aby
+      local dx, dy = x - cx, y - cy
+      if dx * dx + dy * dy < PLAYER_RADIUS * PLAYER_RADIUS then
+        return true
+      end
+    end
+    return false
+  end
+
   local function render()
     local dirx, diry = math.cos(angle), math.sin(angle)
     local planex, planey = -diry * halfTanFov, dirx * halfTanFov
-
-    local subH = h * SUB_ROWS
 
     -- buf[subrow][col] holds a palette index (0-15) at 3x vertical resolution
     local buf = {}
     for sr = 1, subH do
       local line = {}
-      local horizon = subH / 2
-      local shade = sr <= horizon and CEILING_IDX or FLOOR_IDX
+      local shade = sr <= horizonRow and CEILING_IDX or FLOOR_IDX
       for col = 1, w do line[col] = shade end
       buf[sr] = line
     end
@@ -137,6 +196,23 @@ function Engine.run(paletteTbl, level, root)
         local lineHeight = math.max(1, math.floor(subH * wallHeight * WALL_SCALE / bestT))
         local lineTop = math.floor(subH / 2 - lineHeight / 2)
         local lineBottom = lineTop + lineHeight
+
+        local ceilTex = getTexture(sector.ceiling_flat_id)
+        local floorTex = getTexture(sector.floor_flat_id)
+        for sr = 1, lineTop do
+          local d = subRowDist[sr]
+          if d then
+            local wx, wy = px + d * rdx, py + d * rdy
+            buf[sr][col] = sampleFlat(ceilTex, wx, wy) or CEILING_IDX
+          end
+        end
+        for sr = lineBottom + 1, subH do
+          local d = subRowDist[sr]
+          if d then
+            local wx, wy = px + d * rdx, py + d * rdy
+            buf[sr][col] = sampleFlat(floorTex, wx, wy) or FLOOR_IDX
+          end
+        end
 
         local tex = getTexture(bestWall.tex_id)
         local texU
@@ -194,14 +270,21 @@ function Engine.run(paletteTbl, level, root)
     if name == "timer" and ev[2] == timerId then
       local dt = 0.05
       local dirx, diry = math.cos(angle), math.sin(angle)
-      if keysDown[keys.w] then
-        px = px + dirx * MOVE_SPEED * dt
-        py = py + diry * MOVE_SPEED * dt
+
+      local moveDir = 0
+      if keysDown[keys.w] then moveDir = moveDir + 1 end
+      if keysDown[keys.s] then moveDir = moveDir - 1 end
+      if moveDir ~= 0 then
+        local nx = px + dirx * MOVE_SPEED * dt * moveDir
+        local ny = py + diry * MOVE_SPEED * dt * moveDir
+        if not collides(nx, py) then
+          px = nx
+        end
+        if not collides(px, ny) then
+          py = ny
+        end
       end
-      if keysDown[keys.s] then
-        px = px - dirx * MOVE_SPEED * dt
-        py = py - diry * MOVE_SPEED * dt
-      end
+
       if keysDown[keys.a] then
         angle = angle - TURN_SPEED * dt
       end

@@ -1,7 +1,8 @@
 -- Parses the packed-binary level1.dat format written by tools/convert_level.py.
 -- Layout: player_start(i16 x,y,angle), sector_count(u16), sectors[floor(i16),
--- ceiling(i16), light(u8)], wall_count(u16), walls[x1,y1,x2,y2(i16 each),
--- sector(u16), tex_id(u8), x_offset(i16), y_offset(i16)].
+-- ceiling(i16), light(u8), floor_flat_id(u8), ceiling_flat_id(u8)],
+-- wall_count(u16), walls[x1,y1,x2,y2(i16 each), sector(u16), tex_id(u8),
+-- x_offset(i16), y_offset(i16)].
 
 local Level = {}
 
@@ -14,7 +15,10 @@ function Level.parse(data, BinReaderModule)
   local sectorCount = r:u16()
   local sectors = {}
   for i = 1, sectorCount do
-    sectors[i] = { floor = r:i16(), ceiling = r:i16(), light = r:u8() }
+    sectors[i] = {
+      floor = r:i16(), ceiling = r:i16(), light = r:u8(),
+      floor_flat_id = r:u8(), ceiling_flat_id = r:u8(),
+    }
   end
   level.sectors = sectors
 
