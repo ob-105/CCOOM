@@ -15,9 +15,8 @@ from dataclasses import dataclass, asdict
 from .doom_format import (
     read_vertexes, read_linedefs, read_sidedefs, read_sectors, read_things,
 )
+from .thing_types import THING_SPRITE, PLAYER1_START, DEATHMATCH_START
 from .wad import Wad
-
-PLAYER1_START = 1
 
 
 @dataclass
@@ -52,11 +51,55 @@ class SectorOut:
 
 
 @dataclass
+class Sprite:
+    x: int
+    y: int
+    angle: int
+    sprite_name: str
+    floor_z: int
+
+
+@dataclass
 class LevelData:
     player_start: dict
     sectors: list[SectorOut]
     walls: list[Wall]
     portals: list[Portal]
+    sprites: list[Sprite]
+
+
+def _point_to_segment_dist_sq(px, py, x1, y1, x2, y2):
+    abx, aby = x2 - x1, y2 - y1
+    apx, apy = px - x1, py - y1
+    ab_len_sq = abx * abx + aby * aby
+    t = 0.0
+    if ab_len_sq > 0:
+        t = (apx * abx + apy * aby) / ab_len_sq
+        t = max(0.0, min(1.0, t))
+    cx, cy = x1 + t * abx, y1 + t * aby
+    dx, dy = px - cx, py - cy
+    return dx * dx + dy * dy
+
+
+def _sector_at(px, py, walls, portals) -> int:
+    """Same heuristic as the Lua engine's currentSector(): the sector of
+    whichever boundary edge (wall or portal) is nearest to the point,
+    resolving portals via a cross-product side test (front sector is to the
+    right of the directed line v1->v2, per Doom convention)."""
+    best_dist_sq, best_sector = float("inf"), 0
+    for w in walls:
+        d = _point_to_segment_dist_sq(px, py, w.x1, w.y1, w.x2, w.y2)
+        if d < best_dist_sq:
+            best_dist_sq, best_sector = d, w.sector
+    for p in portals:
+        d = _point_to_segment_dist_sq(px, py, p.x1, p.y1, p.x2, p.y2)
+        if d < best_dist_sq:
+            best_dist_sq = d
+            abx, aby = p.x2 - p.x1, p.y2 - p.y1
+            apx, apy = px - p.x1, py - p.y1
+            cross = abx * apy - aby * apx
+            best_sector = p.front_sector if cross < 0 else p.back_sector
+    return best_sector
 
 
 def convert_level(wad: Wad, map_name: str) -> LevelData:
@@ -94,14 +137,28 @@ def convert_level(wad: Wad, map_name: str) -> LevelData:
             player_start = {"x": t.x, "y": t.y, "angle": t.angle}
             break
 
-    return LevelData(player_start, sectors_out, walls, portals)
+    sprites: list[Sprite] = []
+    for t in things:
+        if t.type in (PLAYER1_START, DEATHMATCH_START):
+            continue
+        sprite_name = THING_SPRITE.get(t.type)
+        if sprite_name is None:
+            continue
+        sector_idx = _sector_at(t.x, t.y, walls, portals)
+        sprites.append(Sprite(t.x, t.y, t.angle, sprite_name, sectors_out[sector_idx].floor))
+
+    return LevelData(player_start, sectors_out, walls, portals, sprites)
 
 
 def _i16(v: int) -> int:
     return max(-32768, min(32767, v))
 
 
-def level_to_binary(level: LevelData, tex_id: dict[tuple[str, str], int]) -> bytes:
+def level_to_binary(
+    level: LevelData,
+    tex_id: dict[tuple[str, str], int],
+    sprite_tex_id: dict[str, int],
+) -> bytes:
     out = bytearray()
     out += struct.pack("<hhh", _i16(level.player_start["x"]), _i16(level.player_start["y"]), _i16(level.player_start["angle"]))
 
@@ -127,5 +184,14 @@ def level_to_binary(level: LevelData, tex_id: dict[tuple[str, str], int]) -> byt
             "<hhhhHH",
             _i16(p.x1), _i16(p.y1), _i16(p.x2), _i16(p.y2),
             p.front_sector, p.back_sector,
+        )
+
+    visible_sprites = [s for s in level.sprites if s.sprite_name in sprite_tex_id]
+    out += struct.pack("<H", len(visible_sprites))
+    for s in visible_sprites:
+        out += struct.pack(
+            "<hhhhB",
+            _i16(s.x), _i16(s.y), _i16(s.floor_z), _i16(s.angle),
+            sprite_tex_id[s.sprite_name],
         )
     return bytes(out)

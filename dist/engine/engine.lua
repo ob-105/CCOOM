@@ -1,7 +1,8 @@
--- CCOOM stage-2 engine: textured raycasting walls, per-ray portal-aware
+-- CCOOM stage-3 engine: textured raycasting walls, per-ray portal-aware
 -- floor/ceiling flat casting, wall collision, banded distance fog, full
--- 2x3 teletext sub-pixel resolution, and a full-screen map mode (press M).
--- No sprites/enemies/sound yet -- those are later build-order stages.
+-- 2x3 teletext sub-pixel resolution, a full-screen map mode (press M), and
+-- billboarded decorative sprites (pickups/decorations, not yet pickable).
+-- No enemy AI, weapons, or sound yet -- those are later build-order stages.
 
 local Engine = {}
 
@@ -105,6 +106,50 @@ local function sampleFlat(tex, wx, wy)
   return texturePixel(tex, texY, texX)
 end
 
+-- Sprites are stored with a 4-byte header (origW, origH, storedW, storedH,
+-- all u8) -- origW/origH are the sprite's true pixel size (used for
+-- world-unit scaling, since Doom sprites use 1 texel = 1 map unit, same as
+-- wall textures), storedW/storedH are the downsampled size actually used
+-- for sampling -- followed by 4-bit-packed color data and then a 1-bit-
+-- per-pixel alpha mask (LSB first), since unlike walls/flats, sprites have
+-- real transparency. See tools/build.py.
+local function loadSpriteTexture(root, texId)
+  local f = fs.open(fs.combine(root, "assets/sprites/" .. texId .. ".spr"), "rb")
+  if not f then
+    return false
+  end
+  local header = f.read(4)
+  local origW = string.byte(header, 1)
+  local origH = string.byte(header, 2)
+  local storedW = string.byte(header, 3)
+  local storedH = string.byte(header, 4)
+  local colorRowBytes = math.floor((storedW + 1) / 2)
+  local colorData = f.read(colorRowBytes * storedH)
+  local alphaRowBytes = math.floor((storedW + 7) / 8)
+  local alphaData = f.read(alphaRowBytes * storedH)
+  f.close()
+  return {
+    origW = origW, origH = origH, w = storedW, h = storedH,
+    colorData = colorData, colorRowBytes = colorRowBytes,
+    alphaData = alphaData, alphaRowBytes = alphaRowBytes,
+  }
+end
+
+local function spritePixel(tex, row, col)
+  local colorByteIdx = row * tex.colorRowBytes + math.floor(col / 2) + 1
+  local colorByte = string.byte(tex.colorData, colorByteIdx)
+  local colorIdx
+  if col % 2 == 0 then
+    colorIdx = colorByte % 16
+  else
+    colorIdx = math.floor(colorByte / 16)
+  end
+  local alphaByteIdx = row * tex.alphaRowBytes + math.floor(col / 8) + 1
+  local alphaByte = string.byte(tex.alphaData, alphaByteIdx)
+  local opaque = math.floor(alphaByte / (2 ^ (col % 8))) % 2 == 1
+  return colorIdx, opaque
+end
+
 local BLIT_HEX = "0123456789abcdef"
 
 function Engine.run(paletteTbl, level, root)
@@ -172,11 +217,21 @@ function Engine.run(paletteTbl, level, root)
     return textures[texId]
   end
 
+  local spriteTextures = {}
+  local function getSpriteTexture(texId)
+    if spriteTextures[texId] == nil then
+      spriteTextures[texId] = loadSpriteTexture(root, texId)
+    end
+    return spriteTextures[texId]
+  end
+
   local walls = level.walls
   local sectors = level.sectors
   local portals = level.portals
+  local sprites = level.sprites
   local numWalls = #walls
   local numPortals = #portals
+  local numSprites = #sprites
 
   -- precompute wall lengths once, and the level's bounding box (for map mode)
   local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
@@ -435,6 +490,27 @@ function Engine.run(paletteTbl, level, root)
       end
     end
 
+    -- Same cull for sprites, plus sort far-to-near so overlapping sprites
+    -- paint in the correct order (per-column occlusion against walls is a
+    -- separate depth test below, via wallDistAtCol).
+    local activeSprites, numActiveSprites = {}, 0
+    for i = 1, numSprites do
+      local sprite = sprites[i]
+      local dx, dy = sprite.x - px, sprite.y - py
+      local distSq = dx * dx + dy * dy
+      if distSq < renderDistSq then
+        numActiveSprites = numActiveSprites + 1
+        activeSprites[numActiveSprites] = sprite
+        sprite._distSq = distSq
+      end
+    end
+    table.sort(activeSprites, function(a, b) return a._distSq > b._distSq end)
+
+    -- The player's eye height above their own sector's floor -- needed to
+    -- place sprites at the correct screen row even when the room they're
+    -- standing in has a different floor height than the player's room.
+    local playerEyeZ = sectors[startSectorIdx + 1].floor + EYE_HEIGHT
+
     -- Default fill for columns where no wall is found within RENDER_DIST
     -- (e.g. a long sightline across a large open area). Using the fully-
     -- fogged color rather than the raw placeholder makes those columns
@@ -449,6 +525,8 @@ function Engine.run(paletteTbl, level, root)
       for sc = 1, subW do line[sc] = shade end
       buf[sr] = line
     end
+
+    local wallDistAtCol = {}
 
     for col = 1, w do
       local camx = (w > 1) and (2 * (col - 1) / (w - 1) - 1) or 0
@@ -473,6 +551,7 @@ function Engine.run(paletteTbl, level, root)
           end
         end
       end
+      wallDistAtCol[col] = bestT
 
       if bestWall then
         local sector = sectors[bestWall.sector + 1] -- Lua tables are 1-indexed, sector ids from Python are 0-indexed
@@ -564,6 +643,61 @@ function Engine.run(paletteTbl, level, root)
           local shaded = applyFog(colorIdx or FALLBACK_IDX, bestT)
           buf[sr][sc1] = shaded
           buf[sr][sc2] = shaded
+        end
+      end
+    end
+
+    -- Billboard sprite pass: projected the same way as walls (same dir/
+    -- plane camera basis), but sprites are drawn as 2D cutouts facing the
+    -- player rather than raycast, and depth-tested per column against
+    -- wallDistAtCol so walls correctly occlude them.
+    -- invDet only depends on the camera basis (dir/plane), not the sprite,
+    -- so it's the same for every sprite this frame.
+    local invDet = 1 / (planex * diry - dirx * planey)
+    for i = 1, numActiveSprites do
+      local sprite = activeSprites[i]
+      local dx, dy = sprite.x - px, sprite.y - py
+      local transformX = invDet * (diry * dx - dirx * dy)
+      local transformY = invDet * (-planey * dx + planex * dy)
+
+      if transformY > 0.01 then
+        local tex = getSpriteTexture(sprite.tex_id)
+        if tex then
+          local camx = transformX / transformY
+          local centerCol = (camx + 1) / 2 * (w - 1) + 1
+          local screenWidthCols = w * tex.origW * WALL_SCALE / transformY
+          local screenHeightSubrows = subH * tex.origH * WALL_SCALE / transformY
+
+          local colStart = centerCol - screenWidthCols / 2
+          local colEnd = centerCol + screenWidthCols / 2
+          local rowBottom = horizonRow + ((playerEyeZ - sprite.floor_z) * subH * WALL_SCALE / transformY)
+          local rowTop = rowBottom - screenHeightSubrows
+
+          local colFrom = math.max(1, math.floor(colStart + 1))
+          local colTo = math.min(w, math.floor(colEnd))
+          local rowFrom = math.max(1, math.floor(rowTop + 1))
+          local rowTo = math.min(subH, math.floor(rowBottom))
+
+          if colEnd > colStart and rowBottom > rowTop then
+            for col = colFrom, colTo do
+              if transformY < wallDistAtCol[col] then
+                local texU = math.floor((col - colStart) / (colEnd - colStart) * tex.w)
+                if texU < 0 then texU = 0 elseif texU >= tex.w then texU = tex.w - 1 end
+                local sc1 = (col - 1) * SUB_COLS + 1
+                local sc2 = sc1 + 1
+                for sr = rowFrom, rowTo do
+                  local texV = math.floor((sr - rowTop) / (rowBottom - rowTop) * tex.h)
+                  if texV < 0 then texV = 0 elseif texV >= tex.h then texV = tex.h - 1 end
+                  local colorIdx, opaque = spritePixel(tex, texV, texU)
+                  if opaque then
+                    local shaded = applyFog(colorIdx, transformY)
+                    buf[sr][sc1] = shaded
+                    buf[sr][sc2] = shaded
+                  end
+                end
+              end
+            end
+          end
         end
       end
     end

@@ -42,3 +42,45 @@ def box_downsample(grid: list[list[tuple[int, int, int]]], target_w: int, target
                     cnt += 1
             out[oy][ox] = (rs // cnt, gs // cnt, bs // cnt)
     return out
+
+
+def box_downsample_masked(
+    idx_grid: list[list[int | None]],
+    playpal: list[tuple[int, int, int]],
+    target_w: int,
+    target_h: int,
+) -> tuple[list[list[tuple[int, int, int]]], list[list[bool]]]:
+    """Like box_downsample, but for sprites where some source pixels are
+    transparent (idx_grid value None). Averaging transparent pixels as if
+    they were black would bleed a dark halo into edge colors, so color is
+    only averaged over the opaque source pixels in each output cell; the
+    output cell itself is opaque only if a majority of its source pixels
+    were (a simple, cheap threshold -- exact sub-pixel coverage doesn't
+    matter at this resolution).
+    """
+    height = len(idx_grid)
+    width = len(idx_grid[0])
+    rgb_out = [[(0, 0, 0)] * target_w for _ in range(target_h)]
+    alpha_out = [[False] * target_w for _ in range(target_h)]
+    for oy in range(target_h):
+        sy0 = (oy * height) // target_h
+        sy1 = max(sy0 + 1, ((oy + 1) * height) // target_h)
+        for ox in range(target_w):
+            sx0 = (ox * width) // target_w
+            sx1 = max(sx0 + 1, ((ox + 1) * width) // target_w)
+            rs = gs = bs = opaque = total = 0
+            for yy in range(sy0, sy1):
+                row = idx_grid[yy]
+                for xx in range(sx0, sx1):
+                    total += 1
+                    v = row[xx]
+                    if v is not None:
+                        r, g, b = playpal[v]
+                        rs += r
+                        gs += g
+                        bs += b
+                        opaque += 1
+            if opaque > 0 and opaque * 2 >= total:
+                alpha_out[oy][ox] = True
+                rgb_out[oy][ox] = (rs // opaque, gs // opaque, bs // opaque)
+    return rgb_out, alpha_out

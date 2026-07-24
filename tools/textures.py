@@ -1,6 +1,6 @@
 """Resolves TEXTURE1/TEXTURE2 composite wall textures and namespaced
-patch/flat lumps into RGB pixel grids, using PNAMES + the WAD's P_START/
-P_END and F_START/F_END namespaces.
+patch/flat/sprite lumps into RGB pixel grids, using PNAMES + the WAD's
+P_START/P_END, F_START/F_END, and S_START/S_END namespaces.
 """
 from __future__ import annotations
 
@@ -39,6 +39,16 @@ class TextureBank:
             if name not in self._flat_index:
                 self._flat_index[name] = i
 
+        s_start = wad.find("S_START")
+        s_end = wad.find("S_END")
+        self._sprite_names: list[str] = []
+        self._sprite_index: dict[str, int] = {}
+        for i in range(s_start + 1, s_end):
+            name = wad.lumps[i].name
+            self._sprite_names.append(name)
+            if name not in self._sprite_index:
+                self._sprite_index[name] = i
+
         self._patch_cache: dict[str, tuple[int, int, list[list[int | None]]]] = {}
 
     def _get_patch(self, name: str):
@@ -74,3 +84,32 @@ class TextureBank:
     def flat_pixels(self, name: str) -> list[list[int]]:
         idx = self._flat_index[name]
         return read_flat(self.wad.read(idx))
+
+    def find_sprite_frame(self, prefix: str) -> str | None:
+        """Finds one representative lump for a 4-letter sprite prefix.
+
+        Sprite lumps are named <prefix><frame><rotation>, e.g. "TROOA1", or
+        <prefix><frame><rotation><frame><rotation> when one lump covers two
+        mirrored angles, e.g. "TROOA2A8". We only need a single static
+        frame (no animation/rotation yet), so prefer the non-rotating "A0"
+        frame (common for pickups), else "A1" (a front-facing rotation),
+        else whatever frame A lump exists first.
+        """
+        for candidate in (f"{prefix}A0", f"{prefix}A1"):
+            if candidate in self._sprite_index:
+                return candidate
+        for name in self._sprite_names:
+            if name.startswith(prefix + "A"):
+                return name
+        return None
+
+    def sprite_pixels(self, lump_name: str) -> tuple[int, int, list[list[int | None]]]:
+        """Returns (width, height, grid[y][x] -> palette index or None).
+
+        Doom's patch format also stores a left/top offset for precise
+        anchoring, which we don't use -- sprites are assumed horizontally
+        centered and floor-aligned at the bottom, true for the vast
+        majority of pickup/decoration sprites.
+        """
+        idx = self._sprite_index[lump_name]
+        return read_patch(self.wad.read(idx))
