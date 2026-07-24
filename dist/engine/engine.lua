@@ -1,7 +1,7 @@
--- CCOOM stage-2 engine: textured raycasting walls, floor/ceiling flat
--- casting, wall collision, banded distance fog, full 2x3 teletext
--- sub-pixel resolution, and a full-screen map mode (press M). No
--- sprites/enemies/sound yet -- those are later build-order stages.
+-- CCOOM stage-2 engine: textured raycasting walls, per-ray portal-aware
+-- floor/ceiling flat casting, wall collision, banded distance fog, full
+-- 2x3 teletext sub-pixel resolution, and a full-screen map mode (press M).
+-- No sprites/enemies/sound yet -- those are later build-order stages.
 
 local Engine = {}
 
@@ -160,7 +160,9 @@ function Engine.run(paletteTbl, level, root)
 
   local walls = level.walls
   local sectors = level.sectors
+  local portals = level.portals
   local numWalls = #walls
+  local numPortals = #portals
 
   -- precompute wall lengths once, and the level's bounding box (for map mode)
   local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
@@ -209,14 +211,16 @@ function Engine.run(paletteTbl, level, root)
     end
   end
 
-  -- Approximates "which sector is the player standing in" as the sector of
-  -- whichever wall segment is nearest to the player's actual position --
-  -- cheap (no stored sector polygons/portals needed) and correct as long as
-  -- the player is closer to their own room's walls than to another room's,
-  -- which holds except right at a doorway threshold. Used so floor/ceiling
-  -- texturing reflects the room you're actually in, not whichever room a
-  -- ray happens to hit a wall in (which could be a distant room seen
-  -- through an open doorway with nothing nearer blocking the view).
+  -- Approximates "which sector is the player standing in" (as a sector
+  -- index, not the sector object) as the sector of whichever wall segment
+  -- is nearest to the player's actual position -- cheap (no stored sector
+  -- polygons needed) and correct as long as the player is closer to their
+  -- own room's walls than to another room's, which holds except right at a
+  -- doorway threshold. This is only the STARTING sector for a ray; per-pixel
+  -- floor/ceiling texturing then traces forward through actual portal
+  -- crossings (see the portal-walk in render()) so the texture change
+  -- happens exactly at the doorway in the image, not as a sudden whole-
+  -- screen swap when the player's own position crosses some threshold.
   local function currentSector()
     local bestDistSq, bestSector = math.huge, 0
     for i = 1, numWalls do
@@ -240,7 +244,7 @@ function Engine.run(paletteTbl, level, root)
         bestDistSq, bestSector = distSq, wall.sector
       end
     end
-    return sectors[bestSector + 1]
+    return bestSector
   end
 
   local function collides(x, y)
@@ -359,12 +363,9 @@ function Engine.run(paletteTbl, level, root)
     local dirx, diry = math.cos(angle), math.sin(angle)
     local planex, planey = -diry * halfTanFov, dirx * halfTanFov
 
-    -- Computed once per frame, not per column/ray -- see currentSector's
-    -- comment for why floor/ceiling texturing uses this instead of
-    -- whichever sector each column's ray happens to hit a wall in.
-    local curSector = currentSector()
-    local curCeilTex = getTexture(curSector.ceiling_flat_id)
-    local curFloorTex = getTexture(curSector.floor_flat_id)
+    -- Computed once per frame, not per column/ray -- the seed sector each
+    -- column's portal walk starts from (see currentSector's comment).
+    local startSectorIdx = currentSector()
 
     local buf = {}
     for sr = 1, subH do
@@ -403,11 +404,54 @@ function Engine.run(paletteTbl, level, root)
         local lineTop = math.floor(subH / 2 - lineHeight / 2)
         local lineBottom = lineTop + lineHeight
 
+        -- Find every portal this ray crosses before reaching the solid
+        -- wall, so floor/ceiling texturing can switch sector exactly at
+        -- each crossing distance instead of using one sector for the whole
+        -- column (which is what caused the instant, whole-screen swap).
+        local crossT, crossPortal, numCross = {}, {}, 0
+        for i = 1, numPortals do
+          local portal = portals[i]
+          local ex, ey = portal.x2 - portal.x1, portal.y2 - portal.y1
+          local det = ex * rdy - ey * rdx
+          if det ~= 0 then
+            local ax, ay = portal.x1 - px, portal.y1 - py
+            local t = (ex * ay - ey * ax) / det
+            if t > 0.01 and t < bestT then
+              local s = (rdx * ay - rdy * ax) / det
+              if s >= 0 and s <= 1 then
+                numCross = numCross + 1
+                crossT[numCross] = t
+                crossPortal[numCross] = portal
+              end
+            end
+          end
+        end
+        -- insertion sort by distance (numCross is small: a handful at most)
+        for i = 2, numCross do
+          local t, p, j = crossT[i], crossPortal[i], i - 1
+          while j >= 1 and crossT[j] > t do
+            crossT[j + 1], crossPortal[j + 1] = crossT[j], crossPortal[j]
+            j = j - 1
+          end
+          crossT[j + 1], crossPortal[j + 1] = t, p
+        end
+
+        local function sectorAt(d)
+          local idx = startSectorIdx
+          for i = 1, numCross do
+            if crossT[i] > d then break end
+            local p = crossPortal[i]
+            idx = (idx == p.front_sector) and p.back_sector or p.front_sector
+          end
+          return sectors[idx + 1]
+        end
+
         for sr = 1, lineTop do
           local d = subRowDist[sr]
           if d then
             local wx, wy = px + d * rdx, py + d * rdy
-            local idx = sampleFlat(curCeilTex, wx, wy) or CEILING_IDX
+            local tex = getTexture(sectorAt(d).ceiling_flat_id)
+            local idx = sampleFlat(tex, wx, wy) or CEILING_IDX
             buf[sr][sc] = applyFog(idx, d)
           end
         end
@@ -415,7 +459,8 @@ function Engine.run(paletteTbl, level, root)
           local d = subRowDist[sr]
           if d then
             local wx, wy = px + d * rdx, py + d * rdy
-            local idx = sampleFlat(curFloorTex, wx, wy) or FLOOR_IDX
+            local tex = getTexture(sectorAt(d).floor_flat_id)
+            local idx = sampleFlat(tex, wx, wy) or FLOOR_IDX
             buf[sr][sc] = applyFog(idx, d)
           end
         end

@@ -55,8 +55,9 @@ def main():
     level = convert_level(wad, MAP_NAME)
     wall_tex_names = sorted({w.tex for w in level.walls})
     flat_names = sorted({s.floor_flat for s in level.sectors} | {s.ceiling_flat for s in level.sectors})
-    print(f"Level {MAP_NAME}: {len(level.walls)} solid walls, {len(level.sectors)} sectors, "
-          f"{len(wall_tex_names)} distinct wall textures, {len(flat_names)} distinct flats")
+    print(f"Level {MAP_NAME}: {len(level.walls)} solid walls, {len(level.portals)} portals, "
+          f"{len(level.sectors)} sectors, {len(wall_tex_names)} distinct wall textures, "
+          f"{len(flat_names)} distinct flats")
 
     bank = TextureBank(wad)
     downsampled = {}  # (kind, name) -> (w, h, rgb grid)

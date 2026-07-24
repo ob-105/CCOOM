@@ -2,7 +2,8 @@
 -- Layout: player_start(i16 x,y,angle), sector_count(u16), sectors[floor(i16),
 -- ceiling(i16), light(u8), floor_flat_id(u8), ceiling_flat_id(u8)],
 -- wall_count(u16), walls[x1,y1,x2,y2(i16 each), sector(u16), tex_id(u8),
--- x_offset(i16), y_offset(i16)].
+-- x_offset(i16), y_offset(i16)], portal_count(u16), portals[x1,y1,x2,y2
+-- (i16 each), front_sector(u16), back_sector(u16)].
 
 local Level = {}
 
@@ -32,6 +33,16 @@ function Level.parse(data, BinReaderModule)
     }
   end
   level.walls = walls
+
+  local portalCount = r:u16()
+  local portals = {}
+  for i = 1, portalCount do
+    portals[i] = {
+      x1 = r:i16(), y1 = r:i16(), x2 = r:i16(), y2 = r:i16(),
+      front_sector = r:u16(), back_sector = r:u16(),
+    }
+  end
+  level.portals = portals
 
   return level
 end

@@ -1,11 +1,11 @@
 """Bakes a Doom map (vertexes/linedefs/sidedefs/sectors/things) into the
 engine-friendly format CCOOM's Lua renderer consumes.
 
-Stage 2 scope: solid walls (one-sided linedefs) plus per-sector floor/
-ceiling flats and heights. Two-sided linedefs ("portals") are still not
-carried into the output -- the engine doesn't do room-over-room rendering
-yet -- but sector flats/heights now are, since floor/ceiling casting needs
-them.
+Solid walls (one-sided linedefs) render as before. Two-sided linedefs are
+now carried through as "portals" (front/back sector pair + endpoints) so
+the engine can trace each ray through actual room-to-room crossings for
+floor/ceiling texturing, instead of guessing a single sector for the whole
+column.
 """
 from __future__ import annotations
 
@@ -33,6 +33,16 @@ class Wall:
 
 
 @dataclass
+class Portal:
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+    front_sector: int
+    back_sector: int
+
+
+@dataclass
 class SectorOut:
     floor: int
     ceiling: int
@@ -46,6 +56,7 @@ class LevelData:
     player_start: dict
     sectors: list[SectorOut]
     walls: list[Wall]
+    portals: list[Portal]
 
 
 def convert_level(wad: Wad, map_name: str) -> LevelData:
@@ -63,15 +74,19 @@ def convert_level(wad: Wad, map_name: str) -> LevelData:
     ]
 
     walls: list[Wall] = []
+    portals: list[Portal] = []
 
     for ld in linedefs:
-        if ld.back_sidedef != -1:
-            continue  # two-sided portal; not used by the stage-1 engine
         x1, y1 = vertexes[ld.v1]
         x2, y2 = vertexes[ld.v2]
-        sd = sidedefs[ld.front_sidedef]
-        if sd.middle and sd.middle != "-":
-            walls.append(Wall(x1, y1, x2, y2, sd.sector, sd.middle, sd.x_offset, sd.y_offset))
+        if ld.back_sidedef == -1:
+            sd = sidedefs[ld.front_sidedef]
+            if sd.middle and sd.middle != "-":
+                walls.append(Wall(x1, y1, x2, y2, sd.sector, sd.middle, sd.x_offset, sd.y_offset))
+        else:
+            front = sidedefs[ld.front_sidedef]
+            back = sidedefs[ld.back_sidedef]
+            portals.append(Portal(x1, y1, x2, y2, front.sector, back.sector))
 
     player_start = {"x": 0, "y": 0, "angle": 0}
     for t in things:
@@ -79,7 +94,7 @@ def convert_level(wad: Wad, map_name: str) -> LevelData:
             player_start = {"x": t.x, "y": t.y, "angle": t.angle}
             break
 
-    return LevelData(player_start, sectors_out, walls)
+    return LevelData(player_start, sectors_out, walls, portals)
 
 
 def _i16(v: int) -> int:
@@ -104,5 +119,13 @@ def level_to_binary(level: LevelData, tex_id: dict[tuple[str, str], int]) -> byt
             "<hhhhHBhh",
             _i16(w.x1), _i16(w.y1), _i16(w.x2), _i16(w.y2),
             w.sector, tex_id[("wall", w.tex)], _i16(w.x_offset), _i16(w.y_offset),
+        )
+
+    out += struct.pack("<H", len(level.portals))
+    for p in level.portals:
+        out += struct.pack(
+            "<hhhhHH",
+            _i16(p.x1), _i16(p.y1), _i16(p.x2), _i16(p.y2),
+            p.front_sector, p.back_sector,
         )
     return bytes(out)
