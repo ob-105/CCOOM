@@ -1,6 +1,7 @@
 -- CCOOM stage-2 engine: textured raycasting walls, floor/ceiling flat
--- casting, and wall collision. No sprites/enemies/sound yet -- those are
--- later build-order stages.
+-- casting, wall collision, distance fog, full 2x3 teletext sub-pixel
+-- resolution, and a minimap overlay. No sprites/enemies/sound yet -- those
+-- are later build-order stages.
 
 local Engine = {}
 
@@ -22,14 +23,35 @@ local CEILING_IDX = 0          -- palette index, fallback if a ceiling flat fail
 local FLOOR_IDX = 7            -- palette index, fallback if a floor flat fails to load
 local FALLBACK_IDX = 8         -- palette index shown if a wall texture failed to load
 
+-- Distance fog: fades toward the darkest available palette color between
+-- FOG_START and FOG_END map units, using ordered (Bayer) dithering so a
+-- 16-color palette can still show a gradient instead of a hard cutoff.
+-- Gives a depth cue that raw texture color alone doesn't provide.
+local FOG_START = 250
+local FOG_END = 1700
+local BAYER4 = {
+  { 0, 8, 2, 10 },
+  { 12, 4, 14, 6 },
+  { 3, 11, 1, 9 },
+  { 15, 7, 13, 5 },
+}
+
 -- CC:Tweaked's font has "teletext" mosaic characters at byte codes 128-159:
 -- each splits a cell into a 2-wide x 3-tall grid of sub-pixels, encoded as
 -- 128 + sum of bit weights (1,2,4,8,16) for each of the first 5 sub-cells
 -- that differs from the 6th (bottom-right), which is always the background
--- color. We only vary sub-pixels vertically (both columns of a row always
--- match), giving 3x vertical resolution per cell at no extra ray-cast cost.
+-- color. We use the full grid (both sub-columns, not just sub-rows), giving
+-- 2x horizontal and 3x vertical resolution -- at the cost of roughly
+-- doubling the per-frame ray-cast count (the expensive part of rendering).
 -- Bit-encoding verified against 9551-Dev/pixelbox_lite.
 local SUB_ROWS = 3
+local SUB_COLS = 2
+
+-- Minimap: small north-up 2D overlay in the top-left corner so orientation
+-- doesn't depend on 3D render resolution at all.
+local MINIMAP_COLS = 15
+local MINIMAP_ROWS = 9
+local MINIMAP_WORLD_RADIUS = 700 -- map units shown from center to edge
 
 -- Textures are stored 4-bit-per-pixel (two pixels per byte, low nibble
 -- first) behind a 2-byte (width, height) header -- see tools/build.py.
@@ -83,6 +105,36 @@ function Engine.run(paletteTbl, level, root)
     term.setPaletteColor(2 ^ i, c[1] / 255, c[2] / 255, c[3] / 255)
   end
 
+  -- Pick palette indices for fog and the minimap by inspecting brightness,
+  -- since the actual 16-color palette is generated per-build and its
+  -- indices aren't known ahead of time.
+  local brightestIdx, darkestIdx = 0, 0
+  local brightestSum, darkestSum = -1, math.huge
+  for i = 0, 15 do
+    local c = paletteTbl[i + 1]
+    local sum = c[1] + c[2] + c[3]
+    if sum > brightestSum then brightestSum, brightestIdx = sum, i end
+    if sum < darkestSum then darkestSum, darkestIdx = sum, i end
+  end
+  local FOG_IDX = darkestIdx
+  local MINIMAP_PLAYER_IDX = brightestIdx
+  local MINIMAP_WALL_IDX = darkestIdx == 0 and 1 or 0 -- any index distinct from FOG_IDX
+
+  local function applyFog(colorIdx, dist, sc, sr)
+    if dist <= FOG_START then
+      return colorIdx
+    end
+    local fogAmount = (dist - FOG_START) / (FOG_END - FOG_START)
+    if fogAmount >= 1 then
+      return FOG_IDX
+    end
+    local bx, by = (sc - 1) % 4 + 1, (sr - 1) % 4 + 1
+    if fogAmount > BAYER4[by][bx] / 16 then
+      return FOG_IDX
+    end
+    return colorIdx
+  end
+
   local textures = {}
   local function getTexture(texId)
     if textures[texId] == nil then
@@ -110,6 +162,7 @@ function Engine.run(paletteTbl, level, root)
 
   local halfTanFov = math.tan(FOV / 2)
 
+  local subW = w * SUB_COLS
   local subH = h * SUB_ROWS
   local horizonRow = subH / 2
 
@@ -155,21 +208,57 @@ function Engine.run(paletteTbl, level, root)
     return false
   end
 
+  local subMMW, subMMH = MINIMAP_COLS * SUB_COLS, MINIMAP_ROWS * SUB_ROWS
+  local unitsPerSubCol = (2 * MINIMAP_WORLD_RADIUS) / subMMW
+  local unitsPerSubRow = (2 * MINIMAP_WORLD_RADIUS) / subMMH
+  local minimapRejectDistSq = (MINIMAP_WORLD_RADIUS * 1.5) ^ 2
+
+  local function drawMinimap(buf)
+    for i = 1, numWalls do
+      local wall = walls[i]
+      local dx1, dy1 = wall.x1 - px, wall.y1 - py
+      local dx2, dy2 = wall.x2 - px, wall.y2 - py
+      if math.min(dx1 * dx1 + dy1 * dy1, dx2 * dx2 + dy2 * dy2) <= minimapRejectDistSq then
+        local c1 = subMMW / 2 + dx1 / unitsPerSubCol
+        local r1 = subMMH / 2 + dy1 / unitsPerSubRow
+        local c2 = subMMW / 2 + dx2 / unitsPerSubCol
+        local r2 = subMMH / 2 + dy2 / unitsPerSubRow
+        local steps = math.min(32, math.max(1, math.floor(math.max(math.abs(c2 - c1), math.abs(r2 - r1)))))
+        for step = 0, steps do
+          local t = step / steps
+          local c = math.floor(c1 + (c2 - c1) * t + 0.5)
+          local r = math.floor(r1 + (r2 - r1) * t + 0.5)
+          if c >= 1 and c <= subMMW and r >= 1 and r <= subMMH then
+            buf[r][c] = MINIMAP_WALL_IDX
+          end
+        end
+      end
+    end
+
+    local centerC, centerR = math.floor(subMMW / 2 + 0.5), math.floor(subMMH / 2 + 0.5)
+    buf[centerR][centerC] = MINIMAP_PLAYER_IDX
+    local faceC = math.floor(centerC + math.cos(angle) * 2 + 0.5)
+    local faceR = math.floor(centerR + math.sin(angle) * 2 + 0.5)
+    if faceC >= 1 and faceC <= subMMW and faceR >= 1 and faceR <= subMMH then
+      buf[faceR][faceC] = MINIMAP_PLAYER_IDX
+    end
+  end
+
   local function render()
     local dirx, diry = math.cos(angle), math.sin(angle)
     local planex, planey = -diry * halfTanFov, dirx * halfTanFov
 
-    -- buf[subrow][col] holds a palette index (0-15) at 3x vertical resolution
+    -- buf[subrow][subcol] holds a palette index (0-15) at full sub-pixel resolution
     local buf = {}
     for sr = 1, subH do
       local line = {}
       local shade = sr <= horizonRow and CEILING_IDX or FLOOR_IDX
-      for col = 1, w do line[col] = shade end
+      for sc = 1, subW do line[sc] = shade end
       buf[sr] = line
     end
 
-    for col = 1, w do
-      local camx = (w > 1) and (2 * (col - 1) / (w - 1) - 1) or 0
+    for sc = 1, subW do
+      local camx = (subW > 1) and (2 * (sc - 1) / (subW - 1) - 1) or 0
       local rdx = dirx + planex * camx
       local rdy = diry + planey * camx
 
@@ -203,14 +292,16 @@ function Engine.run(paletteTbl, level, root)
           local d = subRowDist[sr]
           if d then
             local wx, wy = px + d * rdx, py + d * rdy
-            buf[sr][col] = sampleFlat(ceilTex, wx, wy) or CEILING_IDX
+            local idx = sampleFlat(ceilTex, wx, wy) or CEILING_IDX
+            buf[sr][sc] = applyFog(idx, d, sc, sr)
           end
         end
         for sr = lineBottom + 1, subH do
           local d = subRowDist[sr]
           if d then
             local wx, wy = px + d * rdx, py + d * rdy
-            buf[sr][col] = sampleFlat(floorTex, wx, wy) or FLOOR_IDX
+            local idx = sampleFlat(floorTex, wx, wy) or FLOOR_IDX
+            buf[sr][sc] = applyFog(idx, d, sc, sr)
           end
         end
 
@@ -229,33 +320,53 @@ function Engine.run(paletteTbl, level, root)
             local texV = math.floor((frac * wallHeight + bestWall.y_offset)) % tex.h
             colorIdx = texturePixel(tex, texV, texU)
           end
-          buf[sr][col] = colorIdx or FALLBACK_IDX
+          buf[sr][sc] = applyFog(colorIdx or FALLBACK_IDX, bestT, sc, sr)
         end
       end
     end
 
-    -- Pack every 3 sub-rows into one terminal row using a teletext glyph.
+    drawMinimap(buf)
+
+    -- Pack every 2x3 sub-pixel block into one terminal cell using a
+    -- teletext glyph (see the module comment for the bit-encoding).
     for row = 1, h do
-      local base = (row - 1) * SUB_ROWS
-      local rowA, rowB, rowC = buf[base + 1], buf[base + 2], buf[base + 3]
+      local baseRow = (row - 1) * SUB_ROWS
       local textChars, fgChars, bgChars = {}, {}, {}
       for col = 1, w do
-        local top, mid, bottom = rowA[col], rowB[col], rowC[col]
+        local baseCol = (col - 1) * SUB_COLS
+        local topLeft = buf[baseRow + 1][baseCol + 1]
+        local topRight = buf[baseRow + 1][baseCol + 2]
+        local midLeft = buf[baseRow + 2][baseCol + 1]
+        local midRight = buf[baseRow + 2][baseCol + 2]
+        local botLeft = buf[baseRow + 3][baseCol + 1]
+        local baseline = buf[baseRow + 3][baseCol + 2]
+
         local code = 128
-        local fgIdx = bottom
-        if top ~= bottom then
-          code = code + 3
-          fgIdx = top
+        local fgIdx = baseline
+        if topLeft ~= baseline then
+          code = code + 1
+          fgIdx = topLeft
         end
-        if mid ~= bottom then
-          code = code + 12
-          if fgIdx == bottom then
-            fgIdx = mid
-          end
+        if topRight ~= baseline then
+          code = code + 2
+          if fgIdx == baseline then fgIdx = topRight end
         end
+        if midLeft ~= baseline then
+          code = code + 4
+          if fgIdx == baseline then fgIdx = midLeft end
+        end
+        if midRight ~= baseline then
+          code = code + 8
+          if fgIdx == baseline then fgIdx = midRight end
+        end
+        if botLeft ~= baseline then
+          code = code + 16
+          if fgIdx == baseline then fgIdx = botLeft end
+        end
+
         textChars[col] = string.char(code)
         fgChars[col] = BLIT_HEX:sub(fgIdx + 1, fgIdx + 1)
-        bgChars[col] = BLIT_HEX:sub(bottom + 1, bottom + 1)
+        bgChars[col] = BLIT_HEX:sub(baseline + 1, baseline + 1)
       end
       term.setCursorPos(1, row)
       term.blit(table.concat(textChars), table.concat(fgChars), table.concat(bgChars))
