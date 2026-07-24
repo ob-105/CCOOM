@@ -1,7 +1,7 @@
 -- CCOOM stage-2 engine: textured raycasting walls, floor/ceiling flat
--- casting, wall collision, distance fog, full 2x3 teletext sub-pixel
--- resolution, and a minimap overlay. No sprites/enemies/sound yet -- those
--- are later build-order stages.
+-- casting, wall collision, banded distance fog, full 2x3 teletext
+-- sub-pixel resolution, and a full-screen map mode (press M). No
+-- sprites/enemies/sound yet -- those are later build-order stages.
 
 local Engine = {}
 
@@ -23,18 +23,17 @@ local CEILING_IDX = 0          -- palette index, fallback if a ceiling flat fail
 local FLOOR_IDX = 7            -- palette index, fallback if a floor flat fails to load
 local FALLBACK_IDX = 8         -- palette index shown if a wall texture failed to load
 
--- Distance fog: fades toward the darkest available palette color between
--- FOG_START and FOG_END map units, using ordered (Bayer) dithering so a
--- 16-color palette can still show a gradient instead of a hard cutoff.
--- Gives a depth cue that raw texture color alone doesn't provide.
-local FOG_START = 250
-local FOG_END = 1700
-local BAYER4 = {
-  { 0, 8, 2, 10 },
-  { 12, 4, 14, 6 },
-  { 3, 11, 1, 9 },
-  { 15, 7, 13, 5 },
-}
+-- Distance fog: darkens color toward black in discrete bands between
+-- FOG_START and FOG_END map units, remapping each of the 16 palette colors
+-- to whichever of the SAME 16 colors is nearest to its darkened version
+-- (there's no room to add new palette entries). This replaced an earlier
+-- per-pixel ordered-dither version of fog: dithering added fine-grained
+-- pixel noise on top of already-detailed, grimy Doom textures, which at
+-- this render resolution just looked like static rather than a gradient.
+-- Flat per-band recoloring has no such artifact.
+local FOG_START = 300
+local FOG_END = 1800
+local FOG_BANDS = 6
 
 -- CC:Tweaked's font has "teletext" mosaic characters at byte codes 128-159:
 -- each splits a cell into a 2-wide x 3-tall grid of sub-pixels, encoded as
@@ -47,11 +46,10 @@ local BAYER4 = {
 local SUB_ROWS = 3
 local SUB_COLS = 2
 
--- Minimap: small north-up 2D overlay in the top-left corner so orientation
--- doesn't depend on 3D render resolution at all.
-local MINIMAP_COLS = 15
-local MINIMAP_ROWS = 9
-local MINIMAP_WORLD_RADIUS = 700 -- map units shown from center to edge
+-- Full-screen map mode (toggled with M), styled after Doom's automap:
+-- shows every wall in the level at a fixed scale that fits the screen,
+-- rather than a small always-on corner minimap.
+local MAP_ZOOM_MARGIN = 0.9 -- fraction of screen the level bounding box fills
 
 -- Textures are stored 4-bit-per-pixel (two pixels per byte, low nibble
 -- first) behind a 2-byte (width, height) header -- see tools/build.py.
@@ -105,9 +103,8 @@ function Engine.run(paletteTbl, level, root)
     term.setPaletteColor(2 ^ i, c[1] / 255, c[2] / 255, c[3] / 255)
   end
 
-  -- Pick palette indices for fog and the minimap by inspecting brightness,
-  -- since the actual 16-color palette is generated per-build and its
-  -- indices aren't known ahead of time.
+  -- Find the brightest/darkest available palette indices (used for the map
+  -- screen's line/background colors) and build the banded fog remap table.
   local brightestIdx, darkestIdx = 0, 0
   local brightestSum, darkestSum = -1, math.huge
   for i = 0, 15 do
@@ -116,23 +113,41 @@ function Engine.run(paletteTbl, level, root)
     if sum > brightestSum then brightestSum, brightestIdx = sum, i end
     if sum < darkestSum then darkestSum, darkestIdx = sum, i end
   end
-  local FOG_IDX = darkestIdx
-  local MINIMAP_PLAYER_IDX = brightestIdx
-  local MINIMAP_WALL_IDX = darkestIdx == 0 and 1 or 0 -- any index distinct from FOG_IDX
+  local MAP_WALL_IDX = brightestIdx
+  local MAP_BG_IDX = darkestIdx
 
-  local function applyFog(colorIdx, dist, sc, sr)
+  local fogTable = {}
+  for band = 0, FOG_BANDS do
+    local darken = band / FOG_BANDS
+    local row = {}
+    for origIdx = 0, 15 do
+      local oc = paletteTbl[origIdx + 1]
+      local tr, tg, tb = oc[1] * (1 - darken), oc[2] * (1 - darken), oc[3] * (1 - darken)
+      local bestIdx, bestDist = origIdx, math.huge
+      for cand = 0, 15 do
+        local cc = paletteTbl[cand + 1]
+        local dr, dg, db = tr - cc[1], tg - cc[2], tb - cc[3]
+        local dist = dr * dr + dg * dg + db * db
+        if dist < bestDist then
+          bestDist, bestIdx = dist, cand
+        end
+      end
+      row[origIdx] = bestIdx
+    end
+    fogTable[band] = row
+  end
+
+  local function applyFog(colorIdx, dist)
     if dist <= FOG_START then
       return colorIdx
     end
-    local fogAmount = (dist - FOG_START) / (FOG_END - FOG_START)
-    if fogAmount >= 1 then
-      return FOG_IDX
+    local band
+    if dist >= FOG_END then
+      band = FOG_BANDS
+    else
+      band = math.floor((dist - FOG_START) / (FOG_END - FOG_START) * FOG_BANDS)
     end
-    local bx, by = (sc - 1) % 4 + 1, (sr - 1) % 4 + 1
-    if fogAmount > BAYER4[by][bx] / 16 then
-      return FOG_IDX
-    end
-    return colorIdx
+    return fogTable[band][colorIdx]
   end
 
   local textures = {}
@@ -147,11 +162,16 @@ function Engine.run(paletteTbl, level, root)
   local sectors = level.sectors
   local numWalls = #walls
 
-  -- precompute wall lengths once
+  -- precompute wall lengths once, and the level's bounding box (for map mode)
+  local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
   for i = 1, numWalls do
     local wall = walls[i]
     local ex, ey = wall.x2 - wall.x1, wall.y2 - wall.y1
     wall.length = math.sqrt(ex * ex + ey * ey)
+    minX = math.min(minX, wall.x1, wall.x2)
+    maxX = math.max(maxX, wall.x1, wall.x2)
+    minY = math.min(minY, wall.y1, wall.y2)
+    maxY = math.max(maxY, wall.y1, wall.y2)
   end
 
   local px, py = level.player_start.x, level.player_start.y
@@ -159,12 +179,17 @@ function Engine.run(paletteTbl, level, root)
 
   local keysDown = {}
   local running = true
+  local showMap = false
 
   local halfTanFov = math.tan(FOV / 2)
 
   local subW = w * SUB_COLS
   local subH = h * SUB_ROWS
   local horizonRow = subH / 2
+
+  local mapCenterX, mapCenterY = (minX + maxX) / 2, (minY + maxY) / 2
+  local mapWorldW, mapWorldH = math.max(1, maxX - minX), math.max(1, maxY - minY)
+  local mapScale = math.min(subW / mapWorldW, subH / mapWorldH) * MAP_ZOOM_MARGIN
 
   -- Perpendicular distance to the floor/ceiling plane at each sub-row,
   -- precomputed once since it only depends on screen geometry (not the
@@ -208,127 +233,19 @@ function Engine.run(paletteTbl, level, root)
     return false
   end
 
-  local subMMW, subMMH = MINIMAP_COLS * SUB_COLS, MINIMAP_ROWS * SUB_ROWS
-  local unitsPerSubCol = (2 * MINIMAP_WORLD_RADIUS) / subMMW
-  local unitsPerSubRow = (2 * MINIMAP_WORLD_RADIUS) / subMMH
-  local minimapRejectDistSq = (MINIMAP_WORLD_RADIUS * 1.5) ^ 2
-
-  local function drawMinimap(buf)
-    for i = 1, numWalls do
-      local wall = walls[i]
-      local dx1, dy1 = wall.x1 - px, wall.y1 - py
-      local dx2, dy2 = wall.x2 - px, wall.y2 - py
-      if math.min(dx1 * dx1 + dy1 * dy1, dx2 * dx2 + dy2 * dy2) <= minimapRejectDistSq then
-        local c1 = subMMW / 2 + dx1 / unitsPerSubCol
-        local r1 = subMMH / 2 + dy1 / unitsPerSubRow
-        local c2 = subMMW / 2 + dx2 / unitsPerSubCol
-        local r2 = subMMH / 2 + dy2 / unitsPerSubRow
-        local steps = math.min(32, math.max(1, math.floor(math.max(math.abs(c2 - c1), math.abs(r2 - r1)))))
-        for step = 0, steps do
-          local t = step / steps
-          local c = math.floor(c1 + (c2 - c1) * t + 0.5)
-          local r = math.floor(r1 + (r2 - r1) * t + 0.5)
-          if c >= 1 and c <= subMMW and r >= 1 and r <= subMMH then
-            buf[r][c] = MINIMAP_WALL_IDX
-          end
-        end
-      end
-    end
-
-    local centerC, centerR = math.floor(subMMW / 2 + 0.5), math.floor(subMMH / 2 + 0.5)
-    buf[centerR][centerC] = MINIMAP_PLAYER_IDX
-    local faceC = math.floor(centerC + math.cos(angle) * 2 + 0.5)
-    local faceR = math.floor(centerR + math.sin(angle) * 2 + 0.5)
-    if faceC >= 1 and faceC <= subMMW and faceR >= 1 and faceR <= subMMH then
-      buf[faceR][faceC] = MINIMAP_PLAYER_IDX
-    end
-  end
-
-  local function render()
-    local dirx, diry = math.cos(angle), math.sin(angle)
-    local planex, planey = -diry * halfTanFov, dirx * halfTanFov
-
-    -- buf[subrow][subcol] holds a palette index (0-15) at full sub-pixel resolution
+  local function newBuf(fillIdx)
     local buf = {}
     for sr = 1, subH do
       local line = {}
-      local shade = sr <= horizonRow and CEILING_IDX or FLOOR_IDX
-      for sc = 1, subW do line[sc] = shade end
+      for sc = 1, subW do line[sc] = fillIdx end
       buf[sr] = line
     end
+    return buf
+  end
 
-    for sc = 1, subW do
-      local camx = (subW > 1) and (2 * (sc - 1) / (subW - 1) - 1) or 0
-      local rdx = dirx + planex * camx
-      local rdy = diry + planey * camx
-
-      local bestT, bestWall, bestS = math.huge, nil, 0
-      for i = 1, numWalls do
-        local wall = walls[i]
-        local ex, ey = wall.x2 - wall.x1, wall.y2 - wall.y1
-        local det = ex * rdy - ey * rdx
-        if det ~= 0 then
-          local ax, ay = wall.x1 - px, wall.y1 - py
-          local t = (ex * ay - ey * ax) / det
-          if t > 0.01 and t < bestT then
-            local s = (rdx * ay - rdy * ax) / det
-            if s >= 0 and s <= 1 then
-              bestT, bestWall, bestS = t, wall, s
-            end
-          end
-        end
-      end
-
-      if bestWall then
-        local sector = sectors[bestWall.sector + 1] -- Lua tables are 1-indexed, sector ids from Python are 0-indexed
-        local wallHeight = sector.ceiling - sector.floor
-        local lineHeight = math.max(1, math.floor(subH * wallHeight * WALL_SCALE / bestT))
-        local lineTop = math.floor(subH / 2 - lineHeight / 2)
-        local lineBottom = lineTop + lineHeight
-
-        local ceilTex = getTexture(sector.ceiling_flat_id)
-        local floorTex = getTexture(sector.floor_flat_id)
-        for sr = 1, lineTop do
-          local d = subRowDist[sr]
-          if d then
-            local wx, wy = px + d * rdx, py + d * rdy
-            local idx = sampleFlat(ceilTex, wx, wy) or CEILING_IDX
-            buf[sr][sc] = applyFog(idx, d, sc, sr)
-          end
-        end
-        for sr = lineBottom + 1, subH do
-          local d = subRowDist[sr]
-          if d then
-            local wx, wy = px + d * rdx, py + d * rdy
-            local idx = sampleFlat(floorTex, wx, wy) or FLOOR_IDX
-            buf[sr][sc] = applyFog(idx, d, sc, sr)
-          end
-        end
-
-        local tex = getTexture(bestWall.tex_id)
-        local texU
-        if tex then
-          texU = math.floor((bestS * bestWall.length + bestWall.x_offset)) % tex.w
-        end
-
-        local rowStart = math.max(1, lineTop + 1)
-        local rowEnd = math.min(subH, lineBottom)
-        for sr = rowStart, rowEnd do
-          local colorIdx
-          if tex then
-            local frac = (sr - 1 - lineTop) / lineHeight
-            local texV = math.floor((frac * wallHeight + bestWall.y_offset)) % tex.h
-            colorIdx = texturePixel(tex, texV, texU)
-          end
-          buf[sr][sc] = applyFog(colorIdx or FALLBACK_IDX, bestT, sc, sr)
-        end
-      end
-    end
-
-    drawMinimap(buf)
-
-    -- Pack every 2x3 sub-pixel block into one terminal cell using a
-    -- teletext glyph (see the module comment for the bit-encoding).
+  -- Packs every 2x3 sub-pixel block into one terminal cell using a teletext
+  -- glyph (see the module comment for the bit-encoding) and blits it.
+  local function flushBuffer(buf)
     for row = 1, h do
       local baseRow = (row - 1) * SUB_ROWS
       local textChars, fgChars, bgChars = {}, {}, {}
@@ -373,6 +290,120 @@ function Engine.run(paletteTbl, level, root)
     end
   end
 
+  local function plotLine(buf, c1, r1, c2, r2, colorIdx)
+    local steps = math.min(64, math.max(1, math.floor(math.max(math.abs(c2 - c1), math.abs(r2 - r1)))))
+    for step = 0, steps do
+      local t = step / steps
+      local c = math.floor(c1 + (c2 - c1) * t + 0.5)
+      local r = math.floor(r1 + (r2 - r1) * t + 0.5)
+      if c >= 1 and c <= subW and r >= 1 and r <= subH then
+        buf[r][c] = colorIdx
+      end
+    end
+  end
+
+  local function renderMap()
+    local buf = newBuf(MAP_BG_IDX)
+
+    for i = 1, numWalls do
+      local wall = walls[i]
+      local c1 = subW / 2 + (wall.x1 - mapCenterX) * mapScale
+      local r1 = subH / 2 + (wall.y1 - mapCenterY) * mapScale
+      local c2 = subW / 2 + (wall.x2 - mapCenterX) * mapScale
+      local r2 = subH / 2 + (wall.y2 - mapCenterY) * mapScale
+      plotLine(buf, c1, r1, c2, r2, MAP_WALL_IDX)
+    end
+
+    local pc = subW / 2 + (px - mapCenterX) * mapScale
+    local pr = subH / 2 + (py - mapCenterY) * mapScale
+    plotLine(buf, pc, pr, pc + math.cos(angle) * 3, pr + math.sin(angle) * 3, MAP_WALL_IDX)
+
+    flushBuffer(buf)
+  end
+
+  local function render()
+    local dirx, diry = math.cos(angle), math.sin(angle)
+    local planex, planey = -diry * halfTanFov, dirx * halfTanFov
+
+    local buf = {}
+    for sr = 1, subH do
+      local line = {}
+      local shade = sr <= horizonRow and CEILING_IDX or FLOOR_IDX
+      for sc = 1, subW do line[sc] = shade end
+      buf[sr] = line
+    end
+
+    for sc = 1, subW do
+      local camx = (subW > 1) and (2 * (sc - 1) / (subW - 1) - 1) or 0
+      local rdx = dirx + planex * camx
+      local rdy = diry + planey * camx
+
+      local bestT, bestWall, bestS = math.huge, nil, 0
+      for i = 1, numWalls do
+        local wall = walls[i]
+        local ex, ey = wall.x2 - wall.x1, wall.y2 - wall.y1
+        local det = ex * rdy - ey * rdx
+        if det ~= 0 then
+          local ax, ay = wall.x1 - px, wall.y1 - py
+          local t = (ex * ay - ey * ax) / det
+          if t > 0.01 and t < bestT then
+            local s = (rdx * ay - rdy * ax) / det
+            if s >= 0 and s <= 1 then
+              bestT, bestWall, bestS = t, wall, s
+            end
+          end
+        end
+      end
+
+      if bestWall then
+        local sector = sectors[bestWall.sector + 1] -- Lua tables are 1-indexed, sector ids from Python are 0-indexed
+        local wallHeight = sector.ceiling - sector.floor
+        local lineHeight = math.max(1, math.floor(subH * wallHeight * WALL_SCALE / bestT))
+        local lineTop = math.floor(subH / 2 - lineHeight / 2)
+        local lineBottom = lineTop + lineHeight
+
+        local ceilTex = getTexture(sector.ceiling_flat_id)
+        local floorTex = getTexture(sector.floor_flat_id)
+        for sr = 1, lineTop do
+          local d = subRowDist[sr]
+          if d then
+            local wx, wy = px + d * rdx, py + d * rdy
+            local idx = sampleFlat(ceilTex, wx, wy) or CEILING_IDX
+            buf[sr][sc] = applyFog(idx, d)
+          end
+        end
+        for sr = lineBottom + 1, subH do
+          local d = subRowDist[sr]
+          if d then
+            local wx, wy = px + d * rdx, py + d * rdy
+            local idx = sampleFlat(floorTex, wx, wy) or FLOOR_IDX
+            buf[sr][sc] = applyFog(idx, d)
+          end
+        end
+
+        local tex = getTexture(bestWall.tex_id)
+        local texU
+        if tex then
+          texU = math.floor((bestS * bestWall.length + bestWall.x_offset)) % tex.w
+        end
+
+        local rowStart = math.max(1, lineTop + 1)
+        local rowEnd = math.min(subH, lineBottom)
+        for sr = rowStart, rowEnd do
+          local colorIdx
+          if tex then
+            local frac = (sr - 1 - lineTop) / lineHeight
+            local texV = math.floor((frac * wallHeight + bestWall.y_offset)) % tex.h
+            colorIdx = texturePixel(tex, texV, texU)
+          end
+          buf[sr][sc] = applyFog(colorIdx or FALLBACK_IDX, bestT)
+        end
+      end
+    end
+
+    flushBuffer(buf)
+  end
+
   local timerId = os.startTimer(0)
   while running do
     local ev = { os.pullEvent() }
@@ -406,10 +437,18 @@ function Engine.run(paletteTbl, level, root)
         running = false
       end
 
-      render()
+      if showMap then
+        renderMap()
+      else
+        render()
+      end
       timerId = os.startTimer(0)
     elseif name == "key" then
-      keysDown[ev[2]] = true
+      if ev[2] == keys.m then
+        showMap = not showMap
+      else
+        keysDown[ev[2]] = true
+      end
     elseif name == "key_up" then
       keysDown[ev[2]] = nil
     elseif name == "terminate" then
