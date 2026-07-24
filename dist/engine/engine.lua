@@ -209,6 +209,40 @@ function Engine.run(paletteTbl, level, root)
     end
   end
 
+  -- Approximates "which sector is the player standing in" as the sector of
+  -- whichever wall segment is nearest to the player's actual position --
+  -- cheap (no stored sector polygons/portals needed) and correct as long as
+  -- the player is closer to their own room's walls than to another room's,
+  -- which holds except right at a doorway threshold. Used so floor/ceiling
+  -- texturing reflects the room you're actually in, not whichever room a
+  -- ray happens to hit a wall in (which could be a distant room seen
+  -- through an open doorway with nothing nearer blocking the view).
+  local function currentSector()
+    local bestDistSq, bestSector = math.huge, 0
+    for i = 1, numWalls do
+      local wall = walls[i]
+      local abx, aby = wall.x2 - wall.x1, wall.y2 - wall.y1
+      local apx, apy = px - wall.x1, py - wall.y1
+      local abLenSq = abx * abx + aby * aby
+      local t = 0
+      if abLenSq > 0 then
+        t = (apx * abx + apy * aby) / abLenSq
+        if t < 0 then
+          t = 0
+        elseif t > 1 then
+          t = 1
+        end
+      end
+      local cx, cy = wall.x1 + t * abx, wall.y1 + t * aby
+      local dx, dy = px - cx, py - cy
+      local distSq = dx * dx + dy * dy
+      if distSq < bestDistSq then
+        bestDistSq, bestSector = distSq, wall.sector
+      end
+    end
+    return sectors[bestSector + 1]
+  end
+
   local function collides(x, y)
     for i = 1, numWalls do
       local wall = walls[i]
@@ -325,6 +359,13 @@ function Engine.run(paletteTbl, level, root)
     local dirx, diry = math.cos(angle), math.sin(angle)
     local planex, planey = -diry * halfTanFov, dirx * halfTanFov
 
+    -- Computed once per frame, not per column/ray -- see currentSector's
+    -- comment for why floor/ceiling texturing uses this instead of
+    -- whichever sector each column's ray happens to hit a wall in.
+    local curSector = currentSector()
+    local curCeilTex = getTexture(curSector.ceiling_flat_id)
+    local curFloorTex = getTexture(curSector.floor_flat_id)
+
     local buf = {}
     for sr = 1, subH do
       local line = {}
@@ -362,13 +403,11 @@ function Engine.run(paletteTbl, level, root)
         local lineTop = math.floor(subH / 2 - lineHeight / 2)
         local lineBottom = lineTop + lineHeight
 
-        local ceilTex = getTexture(sector.ceiling_flat_id)
-        local floorTex = getTexture(sector.floor_flat_id)
         for sr = 1, lineTop do
           local d = subRowDist[sr]
           if d then
             local wx, wy = px + d * rdx, py + d * rdy
-            local idx = sampleFlat(ceilTex, wx, wy) or CEILING_IDX
+            local idx = sampleFlat(curCeilTex, wx, wy) or CEILING_IDX
             buf[sr][sc] = applyFog(idx, d)
           end
         end
@@ -376,7 +415,7 @@ function Engine.run(paletteTbl, level, root)
           local d = subRowDist[sr]
           if d then
             local wx, wy = px + d * rdx, py + d * rdy
-            local idx = sampleFlat(floorTex, wx, wy) or FLOOR_IDX
+            local idx = sampleFlat(curFloorTex, wx, wy) or FLOOR_IDX
             buf[sr][sc] = applyFog(idx, d)
           end
         end
