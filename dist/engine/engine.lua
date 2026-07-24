@@ -39,12 +39,23 @@ local FOG_BANDS = 6
 -- each splits a cell into a 2-wide x 3-tall grid of sub-pixels, encoded as
 -- 128 + sum of bit weights (1,2,4,8,16) for each of the first 5 sub-cells
 -- that differs from the 6th (bottom-right), which is always the background
--- color. We use the full grid (both sub-columns, not just sub-rows), giving
--- 2x horizontal and 3x vertical resolution -- at the cost of roughly
--- doubling the per-frame ray-cast count (the expensive part of rendering).
--- Bit-encoding verified against 9551-Dev/pixelbox_lite.
+-- color. Bit-encoding verified against 9551-Dev/pixelbox_lite.
+--
+-- SUB_COLS is a hardware constant (the glyph is always 2 wide), not a
+-- quality toggle: casting one independent ray per sub-column doubled the
+-- per-frame ray-cast count (already the dominant cost, further stacked with
+-- portal tracing) and made the game noticeably choppy. Instead we cast one
+-- ray per terminal column (matching the vertical-only version's cost) and
+-- duplicate its result into both sub-columns -- full 3x vertical detail
+-- stays, horizontal detail drops back to one sample per character cell.
 local SUB_ROWS = 3
 local SUB_COLS = 2
+
+-- Walls/portals farther than this are already fully fogged to a flat color
+-- (see FOG_END below), so we skip testing them per-ray entirely -- filtered
+-- to a smaller "nearby" list once per frame instead of scanning everything
+-- on every single ray.
+local RENDER_DIST = 2000
 
 -- Full-screen map mode (toggled with M), styled after Doom's automap:
 -- shows every wall in the level at a fixed scale that fits the screen,
@@ -367,6 +378,30 @@ function Engine.run(paletteTbl, level, root)
     -- column's portal walk starts from (see currentSector's comment).
     local startSectorIdx = currentSector()
 
+    -- Cull walls/portals farther than RENDER_DIST once per frame (see the
+    -- constant's comment) instead of testing all of them on every ray.
+    local renderDistSq = RENDER_DIST * RENDER_DIST
+    local activeWalls, numActiveWalls = {}, 0
+    for i = 1, numWalls do
+      local wall = walls[i]
+      local dx1, dy1 = wall.x1 - px, wall.y1 - py
+      local dx2, dy2 = wall.x2 - px, wall.y2 - py
+      if math.min(dx1 * dx1 + dy1 * dy1, dx2 * dx2 + dy2 * dy2) < renderDistSq then
+        numActiveWalls = numActiveWalls + 1
+        activeWalls[numActiveWalls] = wall
+      end
+    end
+    local activePortals, numActivePortals = {}, 0
+    for i = 1, numPortals do
+      local portal = portals[i]
+      local dx1, dy1 = portal.x1 - px, portal.y1 - py
+      local dx2, dy2 = portal.x2 - px, portal.y2 - py
+      if math.min(dx1 * dx1 + dy1 * dy1, dx2 * dx2 + dy2 * dy2) < renderDistSq then
+        numActivePortals = numActivePortals + 1
+        activePortals[numActivePortals] = portal
+      end
+    end
+
     local buf = {}
     for sr = 1, subH do
       local line = {}
@@ -375,14 +410,16 @@ function Engine.run(paletteTbl, level, root)
       buf[sr] = line
     end
 
-    for sc = 1, subW do
-      local camx = (subW > 1) and (2 * (sc - 1) / (subW - 1) - 1) or 0
+    for col = 1, w do
+      local camx = (w > 1) and (2 * (col - 1) / (w - 1) - 1) or 0
       local rdx = dirx + planex * camx
       local rdy = diry + planey * camx
+      local sc1 = (col - 1) * SUB_COLS + 1
+      local sc2 = sc1 + 1
 
       local bestT, bestWall, bestS = math.huge, nil, 0
-      for i = 1, numWalls do
-        local wall = walls[i]
+      for i = 1, numActiveWalls do
+        local wall = activeWalls[i]
         local ex, ey = wall.x2 - wall.x1, wall.y2 - wall.y1
         local det = ex * rdy - ey * rdx
         if det ~= 0 then
@@ -409,8 +446,8 @@ function Engine.run(paletteTbl, level, root)
         -- each crossing distance instead of using one sector for the whole
         -- column (which is what caused the instant, whole-screen swap).
         local crossT, crossPortal, numCross = {}, {}, 0
-        for i = 1, numPortals do
-          local portal = portals[i]
+        for i = 1, numActivePortals do
+          local portal = activePortals[i]
           local ex, ey = portal.x2 - portal.x1, portal.y2 - portal.y1
           local det = ex * rdy - ey * rdx
           if det ~= 0 then
@@ -452,7 +489,9 @@ function Engine.run(paletteTbl, level, root)
             local wx, wy = px + d * rdx, py + d * rdy
             local tex = getTexture(sectorAt(d).ceiling_flat_id)
             local idx = sampleFlat(tex, wx, wy) or CEILING_IDX
-            buf[sr][sc] = applyFog(idx, d)
+            local shaded = applyFog(idx, d)
+            buf[sr][sc1] = shaded
+            buf[sr][sc2] = shaded
           end
         end
         for sr = lineBottom + 1, subH do
@@ -461,7 +500,9 @@ function Engine.run(paletteTbl, level, root)
             local wx, wy = px + d * rdx, py + d * rdy
             local tex = getTexture(sectorAt(d).floor_flat_id)
             local idx = sampleFlat(tex, wx, wy) or FLOOR_IDX
-            buf[sr][sc] = applyFog(idx, d)
+            local shaded = applyFog(idx, d)
+            buf[sr][sc1] = shaded
+            buf[sr][sc2] = shaded
           end
         end
 
@@ -480,7 +521,9 @@ function Engine.run(paletteTbl, level, root)
             local texV = math.floor((frac * wallHeight + bestWall.y_offset)) % tex.h
             colorIdx = texturePixel(tex, texV, texU)
           end
-          buf[sr][sc] = applyFog(colorIdx or FALLBACK_IDX, bestT)
+          local shaded = applyFog(colorIdx or FALLBACK_IDX, bestT)
+          buf[sr][sc1] = shaded
+          buf[sr][sc2] = shaded
         end
       end
     end
