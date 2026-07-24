@@ -54,8 +54,11 @@ local SUB_COLS = 2
 -- Walls/portals farther than this are already fully fogged to a flat color
 -- (see FOG_END below), so we skip testing them per-ray entirely -- filtered
 -- to a smaller "nearby" list once per frame instead of scanning everything
--- on every single ray.
-local RENDER_DIST = 2000
+-- on every single ray. Kept comfortably past FOG_END so a long sightline
+-- across a large open area still finds its actual far wall rather than
+-- falling back to the (now fog-matched, but still an approximation)
+-- default fill.
+local RENDER_DIST = 3200
 
 -- Full-screen map mode (toggled with M), styled after Doom's automap:
 -- shows every wall in the level at a fixed scale that fits the screen,
@@ -223,15 +226,19 @@ function Engine.run(paletteTbl, level, root)
   end
 
   -- Approximates "which sector is the player standing in" (as a sector
-  -- index, not the sector object) as the sector of whichever wall segment
-  -- is nearest to the player's actual position -- cheap (no stored sector
-  -- polygons needed) and correct as long as the player is closer to their
-  -- own room's walls than to another room's, which holds except right at a
-  -- doorway threshold. This is only the STARTING sector for a ray; per-pixel
-  -- floor/ceiling texturing then traces forward through actual portal
-  -- crossings (see the portal-walk in render()) so the texture change
-  -- happens exactly at the doorway in the image, not as a sudden whole-
-  -- screen swap when the player's own position crosses some threshold.
+  -- index, not the sector object) using whichever boundary edge -- wall OR
+  -- portal -- is nearest to the player's actual position. This is only the
+  -- STARTING sector for a ray; per-pixel floor/ceiling texturing then
+  -- traces forward through actual portal crossings (see the portal-walk in
+  -- render()) so the texture change happens exactly at the doorway in the
+  -- image, not as a sudden whole-screen swap.
+  --
+  -- Portals must be considered here, not just solid walls: near an open
+  -- doorway, the nearest boundary is usually the doorway threshold itself
+  -- (a portal), which is often much closer than any solid wall. Skipping
+  -- portals meant the heuristic could grab a distant, wrong-side wall right
+  -- where two rooms meet, which showed up as ceiling/floor textures
+  -- randomly swapping between adjacent rooms as the player moved.
   local function currentSector()
     local bestDistSq, bestSector = math.huge, 0
     for i = 1, numWalls do
@@ -253,6 +260,32 @@ function Engine.run(paletteTbl, level, root)
       local distSq = dx * dx + dy * dy
       if distSq < bestDistSq then
         bestDistSq, bestSector = distSq, wall.sector
+      end
+    end
+    for i = 1, numPortals do
+      local portal = portals[i]
+      local abx, aby = portal.x2 - portal.x1, portal.y2 - portal.y1
+      local apx, apy = px - portal.x1, py - portal.y1
+      local abLenSq = abx * abx + aby * aby
+      local t = 0
+      if abLenSq > 0 then
+        t = (apx * abx + apy * aby) / abLenSq
+        if t < 0 then
+          t = 0
+        elseif t > 1 then
+          t = 1
+        end
+      end
+      local cx, cy = portal.x1 + t * abx, portal.y1 + t * aby
+      local dx, dy = px - cx, py - cy
+      local distSq = dx * dx + dy * dy
+      if distSq < bestDistSq then
+        bestDistSq = distSq
+        -- Doom convention: the front sidedef/sector is to the right of the
+        -- directed line v1->v2. Cross product sign tells us which side the
+        -- player is actually standing on.
+        local cross = abx * apy - aby * apx
+        bestSector = (cross < 0) and portal.front_sector or portal.back_sector
       end
     end
     return bestSector
@@ -402,10 +435,17 @@ function Engine.run(paletteTbl, level, root)
       end
     end
 
+    -- Default fill for columns where no wall is found within RENDER_DIST
+    -- (e.g. a long sightline across a large open area). Using the fully-
+    -- fogged color rather than the raw placeholder makes those columns
+    -- blend into the fog instead of standing out as a bright, unfogged
+    -- vertical bar against correctly-fogged neighboring columns.
+    local ceilingFallback = fogTable[FOG_BANDS][CEILING_IDX]
+    local floorFallback = fogTable[FOG_BANDS][FLOOR_IDX]
     local buf = {}
     for sr = 1, subH do
       local line = {}
-      local shade = sr <= horizonRow and CEILING_IDX or FLOOR_IDX
+      local shade = sr <= horizonRow and ceilingFallback or floorFallback
       for sc = 1, subW do line[sc] = shade end
       buf[sr] = line
     end
